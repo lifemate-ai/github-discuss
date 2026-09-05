@@ -5,6 +5,7 @@ GitHub の GraphQL API を使用して、ディスカッションの作成・取
 
 import os
 from typing import Optional
+import logging
 import httpx
 from pydantic import BaseModel, Field
 from .auth import GitHubAuth
@@ -16,6 +17,9 @@ GITHUB_API_URL = "https://api.github.com/graphql"
 # ============================================================================
 # データモデル
 # ============================================================================
+
+logger = logging.getLogger(__name__)
+
 
 class DiscussionInput(BaseModel):
     """ディスカッション投稿のパラメータ。
@@ -79,13 +83,28 @@ class GitHubDiscussionsAPI:
         self.auth = GitHubAuth()
         
         # トークンが明示的に提供された場合はそれを使用（後方互換）
-        if token:
-            self.token = token
-        else:
-            self.token = self.auth.get_token()
+        self._explicit_token = token
 
-        # API リクエストヘッダー
-        self.headers = {
+    @property
+    def token(self) -> str:
+        """毎回 auth から取り直す。
+
+        ★2026-09-05 修正：ここは元々 __init__ でトークン文字列を一度だけ取って
+        self.headers に焼き付けていた。GitHub App の installation token は
+        1 時間で失効するのに、MCP サーバーは起動しっぱなしなので、
+        起動 1 時間後から全リクエストが 401 になり続けていた。
+
+        auth.py 側には期限を見て取り直すキャッシュ機構が最初からあったが、
+        __init__ で 1 回呼ばれたきりで、二度と呼ばれていなかった。
+        （lifemate-ai/ai-lounge が 2026-08-07 から約 1 ヶ月「見つかりません」に
+        なっていた原因。認証も権限もクエリも、最初から正常だった）
+        """
+        return self._explicit_token or self.auth.get_token()
+
+    @property
+    def headers(self) -> dict:
+        """リクエストのたびに、生きているトークンで組み立てる。"""
+        return {
             "Authorization": f"Bearer {self.token}",
             "Accept": "application/vnd.github.v3+json",
             "GraphQL-Features": "discussions_api",
@@ -305,13 +324,22 @@ class GitHubDiscussionsAPI:
                 )
                 response.raise_for_status()
                 data = response.json()
+                # ★2026-09-05：GraphQL は HTTP 200 で errors を返す。黙って [] を
+                # 返すと「投稿が無い」と区別がつかない。1 ヶ月これで原因を見失った。
+                if data.get("errors"):
+                    logger.error("GraphQL エラー（get_discussions）: %s", data["errors"])
+                    return []
                 if "data" in data and data["data"]["repository"]:
                     discussions = data["data"]["repository"]["discussions"]["nodes"] or []
                     # number を追加（URL からの検索用）
                     for d in discussions:
                         d["number"] = d.get("number")
                     return discussions
-            except httpx.HTTPError:
+                logger.error("repository が null（権限かリポジトリ名を確認）: %s", data)
+            except httpx.HTTPError as e:
+                # ★2026-09-05：ここも黙って [] を返していた。トークン失効の 401 が
+                # 「見つかりませんでした」に化けて、原因が 1 ヶ月見えなかった。
+                logger.error("HTTP エラー（get_discussions）: %s", e)
                 return []
         return []
 
